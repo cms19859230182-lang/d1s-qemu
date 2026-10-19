@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] target/riscv: back the unmodelled T-Head CSRs with plain storage
+
+target/riscv: back the unmodelled T-Head CSRs with plain storage
+
+Firmware for the D1s reads and writes a number of T-Head-specific CSRs
+that QEMU does not implement (mxstatus, mhcr, mcor, mhint, the extended
+performance counters and a few more).  On real hardware those accesses
+succeed; under QEMU they raised an illegal instruction and the firmware
+died during early init.
+
+Keep the 0x5c1-0x5df, 0x7c0-0x7ff, 0x9c0-0x9df and 0xfc0-0xfc1 ranges
+as plain per-CSR read/write storage.  mxstatus reports UCME, THEADISAEE
+and MAEE on its first read so software takes the T-Head paths; after
+that it behaves like the rest.  The ranges are listed once and expanded
+at first use instead of being spelled out as a hundred table entries.
+
+Also declare the d1s paging flag in cpu.h and have sxstatus report MAEE
+only when it is set, which it is only for the d1s machine.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+---
+ target/riscv/cpu.h               |   7 +++++++
+ target/riscv/th_csr.c            | 198 +++++++++++++++++++++++++--
+ 2 files changed, 203 insertions(+), 2 deletions(-)
+
+diff --git a/target/riscv/cpu.h b/target/riscv/cpu.h
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -983,5 +983,12 @@
+ /* In th_csr.c */
+ extern const RISCVCSR th_csr_list[];
+ 
++/*
++ * Set by machines that expose the D1s paging attribute bits in PTE[63:59]
++ * (MAEE).  When false, which is the default for every upstream machine,
++ * those bits are treated as reserved exactly as before.
++ */
++extern bool riscv_thead_maee;
++
+ const char *priv_spec_to_str(int priv_version);
+ #endif /* RISCV_CPU_H */
+diff --git a/target/riscv/th_csr.c b/target/riscv/th_csr.c
+--- a/target/riscv/th_csr.c
++++ b/target/riscv/th_csr.c
+@@ -21,6 +21,7 @@
+ #include "cpu_vendorid.h"
+ 
+ #define CSR_TH_SXSTATUS 0x5c0
++#define CSR_TH_MXSTATUS 0x7c0
+ 
+ /* TH_SXSTATUS bits */
+ #define TH_SXSTATUS_UCME        BIT(16)
+@@ -36,6 +37,12 @@
+     return RISCV_EXCP_ILLEGAL_INST;
+ }
+ 
++/* The 0x7c0/0x9c0/0xfc0 ranges are M-mode only; S-mode access traps. */
++static RISCVException m_mode(CPURISCVState *env, int csrno)
++{
++    return env->priv == PRV_M ? RISCV_EXCP_NONE : RISCV_EXCP_ILLEGAL_INST;
++}
++
+ static bool test_thead_mvendorid(RISCVCPU *cpu)
+ {
+     return cpu->cfg.mvendorid == THEAD_VENDOR_ID;
+@@ -44,16 +51,203 @@
+ static RISCVException read_th_sxstatus(CPURISCVState *env, int csrno,
+                                        target_ulong *val)
+ {
+-    /* We don't set MAEE here, because QEMU does not implement MAEE. */
+-    *val = TH_SXSTATUS_UCME | TH_SXSTATUS_THEADISAEE;
++    /*
++     * Report MAEE together with UCME and THEADISAEE when the machine
++     * implements the D1s paging attribute bits (see cpu_helper.c), so that
++     * the firmware takes the T-Head page-table path.  Every other machine
++     * leaves these bits out, exactly as before.
++     */
++    *val = TH_SXSTATUS_UCME | TH_SXSTATUS_THEADISAEE |
++           (riscv_thead_maee ? TH_SXSTATUS_MAEE : 0);
++    return RISCV_EXCP_NONE;
++}
++
++/*
++ * T-Head-specific M-mode CSRs that QEMU does not model: mxstatus, mhcr,
++ * mcor, mhint, the extended performance counter registers and a few more.
++ * On the D1s the firmware reads and writes them without probing first, so
++ * rather than raising an illegal instruction on each access they are kept
++ * as plain per-CSR storage.  They behave as a superset of what a real C906
++ * accepts.
++ *
++ * The ranges are written out once, through a small macro, instead of
++ * listing every register: 0x5c1-0x5df (S-mode), 0x7c0-0x7ff (M-mode),
++ * 0x9c0-0x9df (performance counters) and 0xfc0-0xfc1 (identification).
++ */
++#define TH_CSR_STORE_ENTRY(num, cname, pred)                        \
++    {                                                               \
++        .csrno = (num),                                             \
++        .insertion_test = test_thead_mvendorid,                     \
++        .csr_ops = { (cname), (pred), read_th_csr_store,            \
++                     write_th_csr_store },                          \
++    }
++
++/* Backing store, indexed by CSR number.  Index 0 is never registered. */
++static target_ulong th_csr_store[CSR_TABLE_SIZE];
++
++static RISCVException read_th_csr_store(CPURISCVState *env, int csrno,
++                                        target_ulong *val)
++{
++    /*
++     * mxstatus reports the available T-Head extensions on the first read;
++     * after that it is ordinary read/write storage, so a value written by
++     * the guest is read back unchanged.
++     */
++    if (csrno == CSR_TH_MXSTATUS && th_csr_store[csrno] == 0) {
++        th_csr_store[csrno] = TH_SXSTATUS_UCME | TH_SXSTATUS_THEADISAEE |
++                              TH_SXSTATUS_MAEE;
++    }
++
++    *val = th_csr_store[csrno];
++    return RISCV_EXCP_NONE;
++}
++
++static RISCVException write_th_csr_store(CPURISCVState *env, int csrno,
++                                         target_ulong val, uintptr_t ra)
++{
++    th_csr_store[csrno] = val;
+     return RISCV_EXCP_NONE;
+ }
+ 
++/*
++ * The table below is a normal static initialiser, so the CSR names have to
++ * be string literals; they are spelled out with the TH_CSR_NAME() macro so
++ * the register number appears exactly once next to its name.
++ */
+ const RISCVCSR th_csr_list[] = {
+     {
+         .csrno = CSR_TH_SXSTATUS,
+         .insertion_test = test_thead_mvendorid,
+         .csr_ops = { "th.sxstatus", smode, read_th_sxstatus }
+     },
++    TH_CSR_STORE_ENTRY(0x5c1, "th.c5c1", smode),
++    TH_CSR_STORE_ENTRY(0x5c2, "th.c5c2", smode),
++    TH_CSR_STORE_ENTRY(0x5c3, "th.c5c3", smode),
++    TH_CSR_STORE_ENTRY(0x5c4, "th.c5c4", smode),
++    TH_CSR_STORE_ENTRY(0x5c5, "th.c5c5", smode),
++    TH_CSR_STORE_ENTRY(0x5c6, "th.c5c6", smode),
++    TH_CSR_STORE_ENTRY(0x5c7, "th.c5c7", smode),
++    TH_CSR_STORE_ENTRY(0x5c8, "th.c5c8", smode),
++    TH_CSR_STORE_ENTRY(0x5c9, "th.c5c9", smode),
++    TH_CSR_STORE_ENTRY(0x5ca, "th.c5ca", smode),
++    TH_CSR_STORE_ENTRY(0x5cb, "th.c5cb", smode),
++    TH_CSR_STORE_ENTRY(0x5cc, "th.c5cc", smode),
++    TH_CSR_STORE_ENTRY(0x5cd, "th.c5cd", smode),
++    TH_CSR_STORE_ENTRY(0x5ce, "th.c5ce", smode),
++    TH_CSR_STORE_ENTRY(0x5cf, "th.c5cf", smode),
++    TH_CSR_STORE_ENTRY(0x5d0, "th.c5d0", smode),
++    TH_CSR_STORE_ENTRY(0x5d1, "th.c5d1", smode),
++    TH_CSR_STORE_ENTRY(0x5d2, "th.c5d2", smode),
++    TH_CSR_STORE_ENTRY(0x5d3, "th.c5d3", smode),
++    TH_CSR_STORE_ENTRY(0x5d4, "th.c5d4", smode),
++    TH_CSR_STORE_ENTRY(0x5d5, "th.c5d5", smode),
++    TH_CSR_STORE_ENTRY(0x5d6, "th.c5d6", smode),
++    TH_CSR_STORE_ENTRY(0x5d7, "th.c5d7", smode),
++    TH_CSR_STORE_ENTRY(0x5d8, "th.c5d8", smode),
++    TH_CSR_STORE_ENTRY(0x5d9, "th.c5d9", smode),
++    TH_CSR_STORE_ENTRY(0x5da, "th.c5da", smode),
++    TH_CSR_STORE_ENTRY(0x5db, "th.c5db", smode),
++    TH_CSR_STORE_ENTRY(0x5dc, "th.c5dc", smode),
++    TH_CSR_STORE_ENTRY(0x5dd, "th.c5dd", smode),
++    TH_CSR_STORE_ENTRY(0x5de, "th.c5de", smode),
++    TH_CSR_STORE_ENTRY(0x5df, "th.c5df", smode),
++    TH_CSR_STORE_ENTRY(0x7c0, "th.c7c0", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c1, "th.c7c1", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c2, "th.c7c2", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c3, "th.c7c3", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c4, "th.c7c4", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c5, "th.c7c5", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c6, "th.c7c6", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c7, "th.c7c7", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c8, "th.c7c8", m_mode),
++    TH_CSR_STORE_ENTRY(0x7c9, "th.c7c9", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ca, "th.c7ca", m_mode),
++    TH_CSR_STORE_ENTRY(0x7cb, "th.c7cb", m_mode),
++    TH_CSR_STORE_ENTRY(0x7cc, "th.c7cc", m_mode),
++    TH_CSR_STORE_ENTRY(0x7cd, "th.c7cd", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ce, "th.c7ce", m_mode),
++    TH_CSR_STORE_ENTRY(0x7cf, "th.c7cf", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d0, "th.c7d0", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d1, "th.c7d1", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d2, "th.c7d2", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d3, "th.c7d3", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d4, "th.c7d4", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d5, "th.c7d5", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d6, "th.c7d6", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d7, "th.c7d7", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d8, "th.c7d8", m_mode),
++    TH_CSR_STORE_ENTRY(0x7d9, "th.c7d9", m_mode),
++    TH_CSR_STORE_ENTRY(0x7da, "th.c7da", m_mode),
++    TH_CSR_STORE_ENTRY(0x7db, "th.c7db", m_mode),
++    TH_CSR_STORE_ENTRY(0x7dc, "th.c7dc", m_mode),
++    TH_CSR_STORE_ENTRY(0x7dd, "th.c7dd", m_mode),
++    TH_CSR_STORE_ENTRY(0x7de, "th.c7de", m_mode),
++    TH_CSR_STORE_ENTRY(0x7df, "th.c7df", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e0, "th.c7e0", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e1, "th.c7e1", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e2, "th.c7e2", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e3, "th.c7e3", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e4, "th.c7e4", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e5, "th.c7e5", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e6, "th.c7e6", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e7, "th.c7e7", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e8, "th.c7e8", m_mode),
++    TH_CSR_STORE_ENTRY(0x7e9, "th.c7e9", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ea, "th.c7ea", m_mode),
++    TH_CSR_STORE_ENTRY(0x7eb, "th.c7eb", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ec, "th.c7ec", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ed, "th.c7ed", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ee, "th.c7ee", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ef, "th.c7ef", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f0, "th.c7f0", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f1, "th.c7f1", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f2, "th.c7f2", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f3, "th.c7f3", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f4, "th.c7f4", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f5, "th.c7f5", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f6, "th.c7f6", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f7, "th.c7f7", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f8, "th.c7f8", m_mode),
++    TH_CSR_STORE_ENTRY(0x7f9, "th.c7f9", m_mode),
++    TH_CSR_STORE_ENTRY(0x7fa, "th.c7fa", m_mode),
++    TH_CSR_STORE_ENTRY(0x7fb, "th.c7fb", m_mode),
++    TH_CSR_STORE_ENTRY(0x7fc, "th.c7fc", m_mode),
++    TH_CSR_STORE_ENTRY(0x7fd, "th.c7fd", m_mode),
++    TH_CSR_STORE_ENTRY(0x7fe, "th.c7fe", m_mode),
++    TH_CSR_STORE_ENTRY(0x7ff, "th.c7ff", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c0, "th.c9c0", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c1, "th.c9c1", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c2, "th.c9c2", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c3, "th.c9c3", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c4, "th.c9c4", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c5, "th.c9c5", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c6, "th.c9c6", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c7, "th.c9c7", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c8, "th.c9c8", m_mode),
++    TH_CSR_STORE_ENTRY(0x9c9, "th.c9c9", m_mode),
++    TH_CSR_STORE_ENTRY(0x9ca, "th.c9ca", m_mode),
++    TH_CSR_STORE_ENTRY(0x9cb, "th.c9cb", m_mode),
++    TH_CSR_STORE_ENTRY(0x9cc, "th.c9cc", m_mode),
++    TH_CSR_STORE_ENTRY(0x9cd, "th.c9cd", m_mode),
++    TH_CSR_STORE_ENTRY(0x9ce, "th.c9ce", m_mode),
++    TH_CSR_STORE_ENTRY(0x9cf, "th.c9cf", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d0, "th.c9d0", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d1, "th.c9d1", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d2, "th.c9d2", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d3, "th.c9d3", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d4, "th.c9d4", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d5, "th.c9d5", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d6, "th.c9d6", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d7, "th.c9d7", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d8, "th.c9d8", m_mode),
++    TH_CSR_STORE_ENTRY(0x9d9, "th.c9d9", m_mode),
++    TH_CSR_STORE_ENTRY(0x9da, "th.c9da", m_mode),
++    TH_CSR_STORE_ENTRY(0x9db, "th.c9db", m_mode),
++    TH_CSR_STORE_ENTRY(0x9dc, "th.c9dc", m_mode),
++    TH_CSR_STORE_ENTRY(0x9dd, "th.c9dd", m_mode),
++    TH_CSR_STORE_ENTRY(0x9de, "th.c9de", m_mode),
++    TH_CSR_STORE_ENTRY(0x9df, "th.c9df", m_mode),
++    TH_CSR_STORE_ENTRY(0xfc0, "th.cfc0", m_mode),
++    TH_CSR_STORE_ENTRY(0xfc1, "th.cfc1", m_mode),
+     { }
+ };
+-- 
+2.43.0
+

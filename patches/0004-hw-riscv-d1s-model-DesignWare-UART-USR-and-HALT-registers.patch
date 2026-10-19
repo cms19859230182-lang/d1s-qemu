@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] hw/riscv: d1s: model DesignWare UART USR and HALT registers
+
+The D1s UARTs are DesignWare derived.  Besides the 16550 register file
+they have status registers that the generic serial-mm model does not
+cover, notably USR at 0x7c (TX FIFO not full / empty) and HALT at 0xa4.
+The RT-Thread RT-Smart d1s BSP polls USR before every byte it sends.
+Those offsets fell into the catch-all unimplemented window, read as 0,
+and the guest spun forever waiting for "TX FIFO not full".
+
+Map a small read-only window at base+0x20..0xff on both UARTs that
+reports USR = TFNF|TFE and reads 0 elsewhere (HALT never busy); writes
+are ignored.  The 16550 registers at 0x00..0x1c are untouched.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+---
+diff --git a/hw/riscv/d1s.c b/hw/riscv/d1s.c
+--- a/hw/riscv/d1s.c
++++ b/hw/riscv/d1s.c
+@@ -15,8 +15,8 @@
+  *   DRAM           0x40000000  64 MiB     (full)
+  *   PLIC           0x10000000  64 MiB     (full, built on sifive_plic)
+  *   CLINT/ACLINT   0x14000000  64 MiB     (full, mtime ticks at 24 MHz)
+- *   UART0          0x02500000  16550      (full, vendor firmware console)
+- *   UART3          0x02500c00  16550      (full, application console)
++ *   UART0          0x02500000  16550      (full, + DW USR/HALT status)
++ *   UART3          0x02500c00  16550      (full, + DW USR/HALT status)
+  *   everything else                         unimplemented (RAZ/WI)
+  *
+  * The reset vector sits at 0x40100000 because that is the address at which
+@@ -104,6 +104,50 @@
+     { "d1s.periph-mid",  0x18000000, 0x28000000 },
+ };
+ 
++/*
++ * The D1s UART is DesignWare derived and has status registers above the
++ * 16550 register file that serial-mm does not cover.  Drivers poll them:
++ *   USR  (0x7c): bit1 TFNF, bit2 TFE  -> report "TX FIFO empty, not full"
++ *   HALT (0xa4): bit0..7, LCRUP never set -> report 0
++ * Everything else in 0x20..0xff reads as zero and ignores writes.
++ */
++#define D1S_UART_ALIAS_OFFSET   0x20
++#define D1S_UART_ALIAS_SIZE     0xe0
++#define D1S_UART_USR            0x7c
++#define D1S_UART_USR_TFNF_TFE   0x6
++
++static uint64_t d1s_uart_alias_read(void *opaque, hwaddr offset,
++                                    unsigned size)
++{
++    if (offset + D1S_UART_ALIAS_OFFSET == D1S_UART_USR) {
++        return D1S_UART_USR_TFNF_TFE;
++    }
++    return 0;
++}
++
++static void d1s_uart_alias_write(void *opaque, hwaddr offset,
++                                 uint64_t value, unsigned size)
++{
++}
++
++static const MemoryRegionOps d1s_uart_alias_ops = {
++    .read = d1s_uart_alias_read,
++    .write = d1s_uart_alias_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++    .impl = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++static MemoryRegion d1s_uart_alias[2];
++
++static void d1s_uart_alias_init(MemoryRegion *sys, MemoryRegion *mr,
++                                hwaddr base, const char *name)
++{
++    memory_region_init_io(mr, NULL, &d1s_uart_alias_ops, NULL, name,
++                          D1S_UART_ALIAS_SIZE);
++    memory_region_add_subregion(sys, base + D1S_UART_ALIAS_OFFSET, mr);
++}
++
+ static RISCVHartArrayState d1s_harts;
+ 
+ static void d1s_init(MachineState *ms)
+@@ -171,6 +215,11 @@
+                    D1S_UART_REG_SHIFT,
+                    qdev_get_gpio_in(plic, D1S_PLIC_UART3_IRQ),
+                    D1S_UART_BAUD_BASE, serial_hd(0), DEVICE_LITTLE_ENDIAN);
++
++    d1s_uart_alias_init(system_memory, &d1s_uart_alias[0],
++                        d1s_memmap[D1S_UART0].base, "d1s.uart0-dw");
++    d1s_uart_alias_init(system_memory, &d1s_uart_alias[1],
++                        d1s_memmap[D1S_UART3].base, "d1s.uart3-dw");
+ }
+ 
+ static void d1s_machine_init(MachineClass *mc)
+-- 
+2.43.0
+

@@ -1,0 +1,11 @@
+QEMU release:      10.1.2
+Upstream tag:      v10.1.2
+Tag object:        be7ecba5cc5018e7c5bd17784d3068ebfe57e967
+Commit:            ccaea6b2656ec6eab966585f7b16438208f98de7
+Repository:        https://gitlab.com/qemu-project/qemu
+Tarball:           https://download.qemu.org/qemu-10.1.2.tar.xz
+Tarball sha256:    9d75f331c1a5cb9b6eb8fd9f64f563ec2eab346c822cb97f8b35cd82d3f11479
+Tarball signature: https://download.qemu.org/qemu-10.1.2.tar.xz.sig (detached, GnuPG)
+
+The patches in patches/ apply to the tree produced by unpacking the tarball
+above (top-level directory qemu-10.1.2/).  Nothing else is required.

@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] hw/riscv: add a minimal Allwinner D1s (RDC2022) machine
+
+hw/riscv: add a minimal Allwinner D1s (RDC2022) machine
+
+The D1s is a single-core T-Head C906 SoC used on the RDC2022 board.
+Emulating all of it is unnecessary for the common case of running a
+bare-metal or RTOS image that the boot ROM would otherwise load into
+DRAM, so add a machine that models only what such an image touches:
+
+  DRAM           0x40000000  64 MiB
+  PLIC           0x10000000  64 MiB
+  CLINT/ACLINT   0x14000000  mtime at 24 MHz
+  UART0          0x02500000  16550, vendor firmware console
+  UART3          0x02500c00  16550, application console
+
+Everything else is covered by unimplemented devices, so stray accesses
+read as zero and are ignored instead of aborting.
+
+The machine lives behind its own CONFIG_ALLWINNER_D1S symbol rather
+than borrowing an unrelated one, and the structure follows the existing
+hw/riscv/shakti_c.c board.
+
+The reset vector is 0x40100000, the address the D1s FEL loader uses for
+the chunk it hands control to, which lets a small trampoline bring up
+OpenSBI from DRAM.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+---
+ hw/riscv/Kconfig                 |   9 +++++++++
+ hw/riscv/meson.build             |   1 +
+ hw/riscv/d1s.c                   | 192 +++++++++++++++++++++++++
+ 3 files changed, 202 insertions(+), 0 deletions(-)
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -9,6 +9,15 @@
+ 
+ # RISC-V machines in alphabetical order
+ 
++config ALLWINNER_D1S
++    bool
++    default y
++    depends on RISCV64
++    select RISCV_ACLINT
++    select SERIAL_MM
++    select SIFIVE_PLIC
++    select UNIMP
++
+ config MICROCHIP_PFSOC
+     bool
+     default y
+diff --git a/hw/riscv/meson.build b/hw/riscv/meson.build
+--- a/hw/riscv/meson.build
++++ b/hw/riscv/meson.build
+@@ -5,6 +5,7 @@
+ riscv_ss.add(when: 'CONFIG_OPENTITAN', if_true: files('opentitan.c'))
+ riscv_ss.add(when: 'CONFIG_RISCV_VIRT', if_true: files('virt.c'))
+ riscv_ss.add(when: 'CONFIG_SHAKTI_C', if_true: files('shakti_c.c'))
++riscv_ss.add(when: 'CONFIG_ALLWINNER_D1S', if_true: files('d1s.c'))
+ riscv_ss.add(when: 'CONFIG_SIFIVE_E', if_true: files('sifive_e.c'))
+ riscv_ss.add(when: 'CONFIG_SIFIVE_U', if_true: files('sifive_u.c'))
+ riscv_ss.add(when: 'CONFIG_SPIKE', if_true: files('spike.c'))
+diff --git a/hw/riscv/d1s.c b/hw/riscv/d1s.c
+new file mode 100644
+--- /dev/null
++++ b/hw/riscv/d1s.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Allwinner D1s (RDC2022 board) minimal machine.
++ *
++ * Copyright (c) 2026 cms19859230182-lang
++ *
++ * Structure follows the existing hw/riscv/shakti_c.c machine: a single flat
++ * MMIO map, a PLIC, an ACLINT/CLINT pair and a 16550 UART, with every
++ * unmapped peripheral window covered by an "unimplemented device" so that
++ * guest drivers touching them get RAZ/WI instead of an unassigned-access
++ * abort.
++ *
++ * The D1s is a single-core T-Head C906 SoC.  This machine models just enough
++ * of it to bring up an RT-Thread image loaded directly into DRAM, which is
++ * useful for debugging when no board is at hand:
++ *
++ *   DRAM           0x40000000  64 MiB     (full)
++ *   PLIC           0x10000000  64 MiB     (full, built on sifive_plic)
++ *   CLINT/ACLINT   0x14000000  64 MiB     (full, mtime ticks at 24 MHz)
++ *   UART0          0x02500000  16550      (full, vendor firmware console)
++ *   UART3          0x02500c00  16550      (full, application console)
++ *   everything else                         unimplemented (RAZ/WI)
++ *
++ * The reset vector sits at 0x40100000 because that is the address at which
++ * the D1s FEL loader places a chunk to be executed; the usual boot chain is
++ *
++ *   trampoline @ 0x40100000 -> OpenSBI @ 0x40000000 -> payload @ 0x40400000
++ *                              DTB      @ 0x40200000
++ *
++ * The machine sets the d1s-specific T-Head paging attribute flag so that
++ * software-written PTEs carrying MAEE attribute bits in [63:59] do not
++ * fault; see target/riscv/cpu_helper.c.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qapi/error.h"
++#include "hw/boards.h"
++#include "hw/char/serial-mm.h"
++#include "hw/intc/riscv_aclint.h"
++#include "hw/intc/sifive_plic.h"
++#include "hw/misc/unimp.h"
++#include "hw/riscv/riscv_hart.h"
++#include "system/system.h"
++#include "system/address-spaces.h"
++#include "target/riscv/cpu.h"
++
++enum {
++    D1S_DRAM,
++    D1S_UART0,
++    D1S_UART3,
++    D1S_PLIC,
++    D1S_CLINT,
++};
++
++static const struct MemmapEntry {
++    hwaddr base;
++    hwaddr size;
++} d1s_memmap[] = {
++    [D1S_DRAM]  = { 0x40000000,  64 * MiB },
++    [D1S_UART0] = { 0x02500000,  0x400    },
++    [D1S_UART3] = { 0x02500c00,  0x400    },
++    [D1S_PLIC]  = { 0x10000000,  64 * MiB },
++    [D1S_CLINT] = { 0x14000000,  64 * MiB },
++};
++
++/* IRQ numbers on the D1s PLIC. */
++#define D1S_PLIC_UART0_IRQ      18
++#define D1S_PLIC_UART3_IRQ      21
++
++/* D1s PLIC layout: 177 sources, 31 priorities, 1 "MS" context. */
++#define D1S_PLIC_NUM_SOURCES    177
++#define D1S_PLIC_NUM_PRIORITIES 31
++#define D1S_PLIC_PRIORITY_BASE  0x0
++#define D1S_PLIC_PENDING_BASE   0x1000
++#define D1S_PLIC_ENABLE_BASE    0x2000
++#define D1S_PLIC_ENABLE_STRIDE  0x80
++#define D1S_PLIC_CONTEXT_BASE   0x200000
++#define D1S_PLIC_CONTEXT_STRIDE 0x1000
++
++/*
++ * UART clock is 24 MHz; the divisor programmed by the firmware does not
++ * matter for emulation, only the chardev back end does.
++ */
++#define D1S_UART_BAUD_BASE      1500000
++#define D1S_UART_REG_SHIFT      2
++/* ACLINT reference clock on the D1s. */
++#define D1S_TIMEBASE_FREQ       24000000
++
++/* Address at which the FEL loader hands over control. */
++#define D1S_RESETVEC            0x40100000
++
++/* Unimplemented windows that cover every peripheral block we do not model. */
++static const struct {
++    const char *name;
++    hwaddr base;
++    hwaddr size;
++} d1s_unimp[] = {
++    /*
++     * CCU, PIO, SYSCFG, the remaining UARTs, timers, watchdog, DMA, SPI,
++     * I2C, GPIO, ... all live below 0x10000000 except for the blocks
++     * below; UART0/UART3 are mapped on top of this window.
++     */
++    { "d1s.periph-low",  0x00000000, 0x10000000 },
++    /* USB, SD/MMC, G2D, display, audio, DDR controller, ... */
++    { "d1s.periph-mid",  0x18000000, 0x28000000 },
++};
++
++static RISCVHartArrayState d1s_harts;
++
++static void d1s_init(MachineState *ms)
++{
++    MemoryRegion *system_memory = get_system_memory();
++    DeviceState *plic;
++    size_t i;
++
++    /*
++     * Tell the T-Head translation code that this SoC stores paging
++     * attributes in PTE[63:59].  Defaults to false for every other
++     * machine, so nothing else changes.
++     */
++    riscv_thead_maee = true;
++
++    object_initialize_child(OBJECT(ms), "harts", &d1s_harts,
++                            TYPE_RISCV_HART_ARRAY);
++    object_property_set_str(OBJECT(&d1s_harts), "cpu-type", ms->cpu_type,
++                            &error_abort);
++    object_property_set_int(OBJECT(&d1s_harts), "num-harts", 1,
++                            &error_abort);
++    object_property_set_int(OBJECT(&d1s_harts), "resetvec", D1S_RESETVEC,
++                            &error_abort);
++    sysbus_realize(SYS_BUS_DEVICE(&d1s_harts), &error_fatal);
++
++    memory_region_add_subregion(system_memory, d1s_memmap[D1S_DRAM].base,
++                                ms->ram);
++
++    for (i = 0; i < ARRAY_SIZE(d1s_unimp); i++) {
++        create_unimplemented_device(d1s_unimp[i].name, d1s_unimp[i].base,
++                                    d1s_unimp[i].size);
++    }
++
++    plic = sifive_plic_create(d1s_memmap[D1S_PLIC].base,
++                              (char *)"MS", 1, 0,
++                              D1S_PLIC_NUM_SOURCES,
++                              D1S_PLIC_NUM_PRIORITIES,
++                              D1S_PLIC_PRIORITY_BASE,
++                              D1S_PLIC_PENDING_BASE,
++                              D1S_PLIC_ENABLE_BASE,
++                              D1S_PLIC_ENABLE_STRIDE,
++                              D1S_PLIC_CONTEXT_BASE,
++                              D1S_PLIC_CONTEXT_STRIDE,
++                              d1s_memmap[D1S_PLIC].size);
++
++    riscv_aclint_swi_create(d1s_memmap[D1S_CLINT].base, 0, 1, false);
++    riscv_aclint_mtimer_create(d1s_memmap[D1S_CLINT].base +
++                               RISCV_ACLINT_SWI_SIZE,
++                               RISCV_ACLINT_DEFAULT_MTIMER_SIZE, 0, 1,
++                               RISCV_ACLINT_DEFAULT_MTIMECMP,
++                               RISCV_ACLINT_DEFAULT_MTIME,
++                               D1S_TIMEBASE_FREQ, true);
++    create_unimplemented_device("d1s.clint-ext",
++                                d1s_memmap[D1S_CLINT].base + 0xC000,
++                                d1s_memmap[D1S_CLINT].size - 0xC000);
++
++    /* UART0 is the vendor firmware console; it is not wired to the shell. */
++    serial_mm_init(system_memory, d1s_memmap[D1S_UART0].base,
++                   D1S_UART_REG_SHIFT,
++                   qdev_get_gpio_in(plic, D1S_PLIC_UART0_IRQ),
++                   D1S_UART_BAUD_BASE, serial_hd(1), DEVICE_LITTLE_ENDIAN);
++
++    /* UART3 is the application console. */
++    serial_mm_init(system_memory, d1s_memmap[D1S_UART3].base,
++                   D1S_UART_REG_SHIFT,
++                   qdev_get_gpio_in(plic, D1S_PLIC_UART3_IRQ),
++                   D1S_UART_BAUD_BASE, serial_hd(0), DEVICE_LITTLE_ENDIAN);
++}
++
++static void d1s_machine_init(MachineClass *mc)
++{
++    static const char * const valid_cpu_types[] = {
++        RISCV_CPU_TYPE_NAME("thead-c906"),
++        NULL
++    };
++
++    mc->desc = "Allwinner D1s (RDC2022) minimal, direct DRAM load";
++    mc->init = d1s_init;
++    mc->max_cpus = 1;
++    mc->default_cpu_type = RISCV_CPU_TYPE_NAME("thead-c906");
++    mc->valid_cpu_types = valid_cpu_types;
++    mc->default_ram_id = "d1s.dram";
++    mc->default_ram_size = 64 * MiB;
++}
++
++DEFINE_MACHINE("d1s", d1s_machine_init)
+-- 
+2.43.0
+

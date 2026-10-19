@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] target/riscv: strip D1s MAEE paging attributes from PTEs
+
+target/riscv: strip D1s MAEE paging attributes from PTEs
+
+The D1s uses PTE[63:59] to carry T-Head MAEE cacheability and ordering
+attributes.  Upstream QEMU treats those bits as reserved and refuses to
+translate, so an OS or RTOS that programs such a page table faults
+immediately.
+
+Add a per-machine flag, set only by the new d1s machine, that makes the
+page table walk drop the attribute bits before interpreting the PTE.
+The bits are put back around the atomic accessed/dirty update so the
+guest's table keeps its attributes and the compare-and-swap still
+matches memory.  The attributes themselves are not modelled: there is
+no cache or strongly-ordered access emulation behind them.  With the
+flag left at false, which is the default for every other machine,
+behaviour is unchanged.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+---
+ target/riscv/cpu_helper.c        |  33 +++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/target/riscv/cpu_helper.c b/target/riscv/cpu_helper.c
+--- a/target/riscv/cpu_helper.c
++++ b/target/riscv/cpu_helper.c
+@@ -1163,6 +1163,16 @@
+ }
+ 
+ /*
++ * The D1s exposes T-Head MAEE cacheability/ordering attributes in
++ * PTE[63:59].  Only the d1s machine sets this flag; every other machine
++ * leaves it false and the bits stay reserved.
++ */
++bool riscv_thead_maee;
++
++/* MAEE attribute bits, stripped before the PTE is interpreted. */
++#define TH_MAEE_PTE_MASK 0xF800000000000000ULL
++
++/*
+  * get_physical_address - get the physical address for this virtual address
+  *
+  * Do a page table walk to obtain the physical address corresponding to a
+@@ -1318,10 +1328,12 @@
+ 
+     int ptshift = (levels - 1) * ptidxbits;
+     target_ulong pte;
++    target_ulong th_attr = 0;
+     hwaddr pte_addr;
+     int i;
+ 
+  restart:
++    th_attr = 0;
+     for (i = 0; i < levels; i++, ptshift -= ptidxbits) {
+         target_ulong idx;
+         if (i == 0) {
+@@ -1374,6 +1386,17 @@
+             return TRANSLATE_FAIL;
+         }
+ 
++        if (riscv_thead_maee && riscv_cpu_sxl(env) != MXL_RV32) {
++            /*
++             * MAEE attributes are not modelled: drop them so that the rest
++             * of the walk sees a plain Sv39/Sv48 PTE.  @th_attr is carried
++             * across the atomic A/D update below so the guest's table keeps
++             * its attributes.
++             */
++            th_attr = pte & TH_MAEE_PTE_MASK;
++            pte &= ~TH_MAEE_PTE_MASK;
++        }
++
+         if (riscv_cpu_sxl(env) == MXL_RV32) {
+             ppn = pte >> PTE_PPN_SHIFT;
+         } else {
+@@ -1570,8 +1593,14 @@
+                 old_pte = qatomic_cmpxchg((uint32_t *)pte_pa, cpu_to_le32(pte), cpu_to_le32(updated_pte));
+                 old_pte = le32_to_cpu(old_pte);
+             } else {
+-                old_pte = qatomic_cmpxchg(pte_pa, cpu_to_le64(pte), cpu_to_le64(updated_pte));
+-                old_pte = le64_to_cpu(old_pte);
++                /*
++                 * Put the MAEE bits back before comparing and writing, so
++                 * the compare-and-swap matches what is actually in memory.
++                 */
++                old_pte = qatomic_cmpxchg(pte_pa,
++                                          cpu_to_le64(pte | th_attr),
++                                          cpu_to_le64(updated_pte | th_attr));
++                old_pte = le64_to_cpu(old_pte) & ~th_attr;
+             }
+             if (old_pte != pte) {
+                 goto restart;
+-- 
+2.43.0
+
