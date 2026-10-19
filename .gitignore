@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Upstream QEMU source trees fetched by scripts/fetch-qemu.sh, and whatever
+# a local build leaves behind.
+/qemu-*/
+*.tar.xz
+*.tar.xz.part
