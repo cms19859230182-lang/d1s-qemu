@@ -79,8 +79,8 @@ RT-Thread 的 D1s BSP 在上游 `bsp/allwinner/d1s`：
   该移植的早期版本在真板上也已进到 `msh />`。该移植以后会单独整理提交。
 - **上游 `bsp/allwinner/d1s`（RT-Smart，默认配置）**：能编过，启动链正确，
   用 `./run.sh rtthread.bin --bsp <d1s 目录> --console uart0` 能打印出
-  RT-Thread Smart 的启动 banner；但随后在 SD/MMC 初始化时出现 Load Page Fault，
-  因为本模拟器**没有 SD/MMC 控制器**，所以**暂时到不了 `msh />`**。这是后续工作。
+  RT-Thread Smart 的启动 banner，完成 SMHC0/SMHC1 探测（空白 SD 镜像即可），
+  并进入 `msh />`。根文件系统挂载可能因镜像无 FAT 分区而失败，与模拟器无关。
 
 ### 外设支持情况
 
@@ -92,14 +92,16 @@ RT-Thread 的 D1s BSP 在上游 `bsp/allwinner/d1s`：
 | UART0 | `0x02500000` | 完整 | 同上，IRQ 18 |
 | PLIC | `0x10000000` | 完整 | 上游 `sifive_plic`，177 个中断源 |
 | CLINT | `0x14000000` | 完整 | 上游 `riscv_aclint`，mtime 24 MHz |
-| 其他所有外设（CCU、PIO/GPIO、其他 UART、定时器、看门狗、DMA、SPI、I2C、USB、SD/MMC、以太网、显示、音频、DDR 控制器……） | 其余地址 | 未模拟 | 兜底区：读返回 0、写被忽略（`--trace` 可看到访问日志） |
+| SMHC0（SD/MMC） | `0x04020000` | 完整 | 复用上游 `allwinner-sdhost-sun50i-a64`，IRQ 56；`run.sh` 默认挂 `-drive if=sd,index=0` |
+| SMHC1（SDIO） | `0x04021000` | 完整 | 同上，IRQ 57；默认 `index=1` |
+| 其他所有外设（CCU、PIO/GPIO、其他 UART、定时器、看门狗、DMA、SPI、I2C、USB、SMHC2/eMMC、以太网、显示、音频、DDR 控制器……） | 其余地址 | 未模拟 | 兜底区：读返回 0、写被忽略（`--trace` 可看到访问日志） |
 
 ### 已知局限
 
 - T-Head 扩展只做到“能跑”：自定义 CSR（`mxstatus`、`mhcr` 等）只是可读写的存储，
   没有副作用；**MAEE / mxstatus 的页表属性位 `PTE[63:59]` 只是剥掉再翻译，
   不建模**缓存性 / 强序语义。
-- **没有 USB、没有 SD 卡**，也没有显示、音频、以太网。
+- **没有 USB、没有 SMHC2/eMMC**，也没有显示、音频、以太网。SMHC0/SMHC1 已接。
 - 只能直接加载到 RAM，不模拟 BROM / FEL / SPI flash 启动。
 - 单核（`max_cpus = 1`）。
 - 时钟树不模拟：写 CCU 无效果，读回为 0；依赖读回值的驱动可能卡住或算错。
@@ -190,9 +192,9 @@ Current status, stated plainly:
   `msh />`; `version`, `free` and `list thread` work, also after two
   minutes idle. An earlier build of the port also reached `msh />` on the real board.
 - Upstream `bsp/allwinner/d1s` (RT-Smart, default config) builds, and with
-  `--console uart0` prints the RT-Thread Smart banner, then takes a load
-  page fault during SD/MMC init because **SD/MMC is not modelled**. It does
-  **not reach `msh />` yet**.
+  `--console uart0` prints the RT-Thread Smart banner, probes SMHC0/SMHC1
+  (blank SD images are enough), and reaches `msh />`. Rootfs mount may fail
+  if the SD image has no FAT partition; that is unrelated to the emulator.
 
 ### Peripherals
 
@@ -204,7 +206,9 @@ Current status, stated plainly:
 | UART0 | `0x02500000` | full | same, IRQ 18 |
 | PLIC | `0x10000000` | full | upstream `sifive_plic`, 177 sources |
 | CLINT | `0x14000000` | full | upstream `riscv_aclint`, 24 MHz mtime |
-| Everything else (CCU, PIO/GPIO, other UARTs, timers, watchdog, DMA, SPI, I2C, USB, SD/MMC, Ethernet, display, audio, DRAM controller, …) | rest of the map | not modelled | catch-all window: reads 0, writes ignored |
+| SMHC0 (SD/MMC) | `0x04020000` | full | reuses upstream `allwinner-sdhost-sun50i-a64`, IRQ 56; `run.sh` attaches `-drive if=sd,index=0` by default |
+| SMHC1 (SDIO) | `0x04021000` | full | same, IRQ 57; default `index=1` |
+| Everything else (CCU, PIO/GPIO, other UARTs, timers, watchdog, DMA, SPI, I2C, USB, SMHC2/eMMC, Ethernet, display, audio, DRAM controller, …) | rest of the map | not modelled | catch-all window: reads 0, writes ignored |
 
 ### Known limitations
 
@@ -212,7 +216,7 @@ Current status, stated plainly:
   mxstatus page-table attribute bits `PTE[63:59]` are stripped before
   translation, their cacheability / strong-order semantics are **not
   modelled**.
-- No USB, no SD card, no display, audio or Ethernet.
+- No USB, no SMHC2/eMMC, no display, audio or Ethernet. SMHC0/SMHC1 are modelled.
 - Direct RAM load only; BROM / FEL / SPI flash boot is not modelled.
 - Single hart. No clock tree (CCU writes have no effect). No GPIO interrupts.
 - `list thread` crashed on an early test image because of a too-small idle

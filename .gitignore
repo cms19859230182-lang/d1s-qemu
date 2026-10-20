@@ -4,3 +4,6 @@
 /qemu-*/
 *.tar.xz
 *.tar.xz.part
+
+# auto-created by run.sh
+.sdcard*.img

@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] hw/riscv: d1s: wire Allwinner SMHC0/SMHC1 via allwinner-sdhost
+
+hw/riscv: d1s: wire Allwinner SMHC0/SMHC1 via allwinner-sdhost
+
+Reuse the in-tree allwinner-sdhost (sun50i-a64 variant) for the D1s
+SMHC0 (0x04020000, IRQ 56) and SMHC1 (0x04021000, IRQ 57) so that
+upstream RT-Thread bsp/allwinner/d1s can finish SD/MMC init and reach
+msh />.  Also:
+
+  - select CONFIG_SD and compile allwinner-sdhost.c for ALLWINNER_D1S
+  - auto-clear the IDMAC soft-reset bit in allwinner-sdhost (self-
+    clearing on hardware; without this the RTT driver spins forever)
+  - raise PLIC sources from 177 to 256 to cover RTT IRQ_MAX_NR=207
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+
+---
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -17,6 +17,7 @@
+     select SERIAL_MM
+     select SIFIVE_PLIC
+     select UNIMP
++    select SD
+ 
+ config MICROCHIP_PFSOC
+     bool
+--- a/hw/riscv/d1s.c
++++ b/hw/riscv/d1s.c
+@@ -19,6 +19,8 @@
+  *   CLINT/ACLINT   0x14000000  64 MiB     (full, mtime ticks at 24 MHz)
+  *   UART0          0x02500000  16550      (full, + DW USR/HALT status)
+  *   UART3          0x02500c00  16550      (full, + DW USR/HALT status)
++ *   SMHC0 (SD/MMC) 0x04020000  allwinner-sdhost-sun50i-a64 (full)
++ *   SMHC1 (SDIO)   0x04021000  allwinner-sdhost-sun50i-a64 (full)
+  *   everything else                         unimplemented (RAZ/WI)
+  *
+  * The reset vector sits at 0x40100000 because that is the address at which
+@@ -40,6 +42,9 @@
+ #include "hw/intc/riscv_aclint.h"
+ #include "hw/intc/sifive_plic.h"
+ #include "hw/misc/unimp.h"
++#include "hw/sd/allwinner-sdhost.h"
++#include "hw/sd/sd.h"
++#include "system/blockdev.h"
+ #include "hw/riscv/riscv_hart.h"
+ #include "system/system.h"
+ #include "system/address-spaces.h"
+@@ -49,6 +54,8 @@
+     D1S_DRAM,
+     D1S_UART0,
+     D1S_UART3,
++    D1S_MMC0,
++    D1S_MMC1,
+     D1S_PLIC,
+     D1S_CLINT,
+ };
+@@ -60,6 +67,8 @@
+     [D1S_DRAM]  = { 0x40000000,  64 * MiB },
+     [D1S_UART0] = { 0x02500000,  0x400    },
+     [D1S_UART3] = { 0x02500c00,  0x400    },
++    [D1S_MMC0]  = { 0x04020000,  0x1000   },
++    [D1S_MMC1]  = { 0x04021000,  0x1000   },
+     [D1S_PLIC]  = { 0x10000000,  64 * MiB },
+     [D1S_CLINT] = { 0x14000000,  64 * MiB },
+ };
+@@ -67,9 +76,11 @@
+ /* IRQ numbers on the D1s PLIC. */
+ #define D1S_PLIC_UART0_IRQ      18
+ #define D1S_PLIC_UART3_IRQ      21
++#define D1S_PLIC_MMC0_IRQ       56
++#define D1S_PLIC_MMC1_IRQ       57
+ 
+ /* D1s PLIC layout: 177 sources, 31 priorities, 1 "MS" context. */
+-#define D1S_PLIC_NUM_SOURCES    177
++#define D1S_PLIC_NUM_SOURCES    256
+ #define D1S_PLIC_NUM_PRIORITIES 31
+ #define D1S_PLIC_PRIORITY_BASE  0x0
+ #define D1S_PLIC_PENDING_BASE   0x1000
+@@ -102,7 +113,7 @@
+      * below; UART0/UART3 are mapped on top of this window.
+      */
+     { "d1s.periph-low",  0x00000000, 0x10000000 },
+-    /* USB, SD/MMC, G2D, display, audio, DDR controller, ... */
++    /* USB, SMHC1/2, G2D, display, audio, DDR controller, ... */
+     { "d1s.periph-mid",  0x18000000, 0x28000000 },
+ };
+ 
+@@ -222,6 +233,43 @@
+                         d1s_memmap[D1S_UART0].base, "d1s.uart0-dw");
+     d1s_uart_alias_init(system_memory, &d1s_uart_alias[1],
+                         d1s_memmap[D1S_UART3].base, "d1s.uart3-dw");
++
++    /*
++     * SMHC0/SMHC1 — reuse upstream allwinner-sdhost (sun50i-a64 variant:
++     * same register map as D1/sun20i-d1-mmc, including sample-delay /
++     * calibrate).  Mapped on top of the periph-low unimplemented window.
++     * unit 0 ← -drive if=sd,index=0; unit 1 ← index=1 (optional).
++     */
++    {
++        static const struct {
++            int mem_idx;
++            int irq;
++            int sd_unit;
++        } mmcs[] = {
++            { D1S_MMC0, D1S_PLIC_MMC0_IRQ, 0 },
++            { D1S_MMC1, D1S_PLIC_MMC1_IRQ, 1 },
++        };
++        size_t n;
++
++        for (n = 0; n < ARRAY_SIZE(mmcs); n++) {
++            DeviceState *mmc = qdev_new(TYPE_AW_SDHOST_SUN50I_A64);
++            DriveInfo *di = drive_get(IF_SD, 0, mmcs[n].sd_unit);
++            BlockBackend *blk = di ? blk_by_legacy_dinfo(di) : NULL;
++            DeviceState *card = qdev_new(TYPE_SD_CARD);
++
++            object_property_set_link(OBJECT(mmc), "dma-memory",
++                                     OBJECT(system_memory), &error_fatal);
++            sysbus_realize_and_unref(SYS_BUS_DEVICE(mmc), &error_fatal);
++            sysbus_mmio_map(SYS_BUS_DEVICE(mmc), 0,
++                            d1s_memmap[mmcs[n].mem_idx].base);
++            sysbus_connect_irq(SYS_BUS_DEVICE(mmc), 0,
++                               qdev_get_gpio_in(plic, mmcs[n].irq));
++
++            qdev_prop_set_drive_err(card, "drive", blk, &error_fatal);
++            qdev_realize_and_unref(card, qdev_get_child_bus(mmc, "sd-bus"),
++                                   &error_fatal);
++        }
++    }
+ }
+ 
+ static void d1s_machine_init(MachineClass *mc)
+--- a/hw/sd/allwinner-sdhost.c
++++ b/hw/sd/allwinner-sdhost.c
+@@ -128,6 +128,10 @@
+     SD_IDST_WR_MASK         = (0x3ff),
+ };
+ 
++enum {
++    SD_DMAC_SOFT_RST        = (1 << 0),
++};
++
+ /* SD Host register reset values */
+ enum {
+     REG_SD_GCTL_RST         = 0x00000300,
+@@ -699,7 +703,8 @@
+         s->hardware_rst = value;
+         break;
+     case REG_SD_DMAC:      /* Internal DMA Controller Control */
+-        s->dmac = value;
++        /* Soft-reset bit is self-clearing on real hardware. */
++        s->dmac = value & ~SD_DMAC_SOFT_RST;
+         allwinner_sdhost_update_irq(s);
+         break;
+     case REG_SD_DLBA:      /* Descriptor List Base Address */
+--- a/hw/sd/meson.build
++++ b/hw/sd/meson.build
+@@ -8,5 +8,6 @@
+ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_sdhost.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sdhci.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-sdhost.c'))
++system_ss.add(when: 'CONFIG_ALLWINNER_D1S', if_true: files('allwinner-sdhost.c'))
+ system_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_sdhci.c'))
+ system_ss.add(when: 'CONFIG_CADENCE_SDHCI', if_true: files('cadence_sdhci.c'))

@@ -10,6 +10,9 @@
 #                         [--console uart3|uart0]
 #                         [--timeout SECONDS] [--] [qemu args...]
 #
+# SD cards: blank images are auto-created at .sdcard0.img / .sdcard1.img
+# (override with SD_IMG / SD_IMG1).  Needed for upstream d1s to reach msh.
+#
 # The OpenSBI image (sbi.bin) and device tree (u-boot.dtb) are looked up in
 # the directory given by --bsp; if not given, they are taken from
 # $RTT_D1S_BSP.  sbi.bin and u-boot.dtb ship with the RT-Thread tree under
@@ -96,10 +99,26 @@ if [ -n "$timeout" ]; then
     timeout_cmd="timeout $timeout"
 fi
 
+# ----------------------------------------------------------- SD/MMC
+# Upstream bsp/allwinner/d1s probes SMHC0 and SMHC1.  Attach blank raw
+# images by default so card init succeeds; override with SD_IMG / SD_IMG1
+# or pass your own -drive on the command line after --.
+sd_img=${SD_IMG:-$here/.sdcard0.img}
+sd_img1=${SD_IMG1:-$here/.sdcard1.img}
+if [ ! -f "$sd_img" ]; then
+    dd if=/dev/zero of="$sd_img" bs=1M count=64 status=none
+fi
+if [ ! -f "$sd_img1" ]; then
+    dd if=/dev/zero of="$sd_img1" bs=1M count=16 status=none
+fi
+sd_args="-drive if=sd,index=0,file=$sd_img,format=raw"
+sd_args="$sd_args -drive if=sd,index=1,file=$sd_img1,format=raw"
+
 # ----------------------------------------------------------- launch
 exec $timeout_cmd "$qemu" \
     -M d1s -cpu thead-c906 -m 64M -nographic -monitor none \
     $serial_args \
+    $sd_args \
     -bios none \
     -device loader,file="$bsp/sbi.bin",addr=0x40000000,force-raw=on \
     -device loader,file="$bsp/u-boot.dtb",addr=0x40200000,force-raw=on \
