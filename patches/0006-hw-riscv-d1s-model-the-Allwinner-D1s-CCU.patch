@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] hw/riscv: d1s: model the Allwinner D1s CCU
+
+hw/riscv: d1s: model the Allwinner D1s CCU
+
+Replace the RAZ/WI stub at 0x02001000 with a d1s-ccu register file.
+PLL control registers (CPU, DDR, PERI0, VIDEO0/1, VE, AUDIO0/1) reset
+to enabled values and report LOCK (bit 28) whenever EN (bit 31) is
+set, so the sunxi-ng clock code no longer has to time out on PLL lock;
+PSI/AHB, APB0/APB1 and every gate/reset register are plain storage.
+No real frequency is computed.
+
+Upstream RT-Thread bsp/allwinner/d1s still boots to msh />.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+
+---
+diff --git a/hw/misc/d1s_ccu.c b/hw/misc/d1s_ccu.c
+new file mode 100644
+index 000000000..fe7783115
+--- /dev/null
++++ b/hw/misc/d1s_ccu.c
+@@ -0,0 +1,200 @@
++/*
++ * Allwinner D1 SoC Clock Control Unit (CCU) emulation
++ *
++ * Copyright (c) 2026 cms19859230182-lang
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/log.h"
++#include "hw/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++
++#define D1S_CCU_SIZE   0x1000
++
++#define D1S_CCU_REGS_NUM (D1S_CCU_SIZE / sizeof(uint32_t))
++
++#define REG_INDEX(offset)  (offset / sizeof(uint32_t))
++
++/* D1 CCU PLL control register flags */
++enum {
++    REG_PLL_ENABLE   = (1 << 31),
++    REG_PLL_LOCK     = (1 << 28),
++};
++
++/* D1 CCU PLL control register offsets */
++enum {
++    REG_PLL_CPU     = 0x000,
++    REG_PLL_DDR     = 0x010,
++    REG_PLL_PERI0   = 0x020,
++    REG_PLL_VIDEO0  = 0x040,
++    REG_PLL_VIDEO1  = 0x048,
++    REG_PLL_VE      = 0x058,
++    REG_PLL_AUDIO0  = 0x078,
++    REG_PLL_AUDIO1  = 0x080,
++};
++
++/* D1 CCU PLL control register reset values */
++enum {
++    REG_PLL_CPU_RST     = 0xF8002900,
++    REG_PLL_DDR_RST     = 0xF8002B00,
++    REG_PLL_PERI0_RST   = 0xF8216300,
++    REG_PLL_VIDEO0_RST  = 0xF8216300,
++    REG_PLL_VIDEO1_RST  = 0xF8216300,
++    REG_PLL_VE_RST      = 0xF8216300,
++    REG_PLL_AUDIO0_RST  = 0xF8216300,
++    REG_PLL_AUDIO1_RST  = 0xF8216300,
++};
++
++/* D1 CCU bus divider register offsets and reset values */
++enum {
++    REG_PSI_AHB  = 0x510,
++    REG_APB0     = 0x520,
++    REG_APB1     = 0x524,
++};
++
++enum {
++    REG_PSI_AHB_RST = 0x03000102,
++    REG_APB0_RST    = 0x03000102,
++    REG_APB1_RST    = 0x03000000,
++};
++
++#define TYPE_D1S_CCU "d1s-ccu"
++
++typedef struct D1SCCUState {
++    SysBusDevice parent;
++
++    MemoryRegion iomem;
++    uint32_t regs[D1S_CCU_REGS_NUM];
++} D1SCCUState;
++
++#define D1S_CCU(obj) ((D1SCCUState *)(obj))
++
++static uint64_t d1s_ccu_read(void *opaque, hwaddr offset, unsigned size)
++{
++    D1SCCUState *s = opaque;
++    uint32_t idx = REG_INDEX(offset);
++
++    return s->regs[idx];
++}
++
++static void d1s_ccu_write(void *opaque, hwaddr offset, uint64_t val,
++                          unsigned size)
++{
++    D1SCCUState *s = opaque;
++    uint32_t idx = REG_INDEX(offset);
++
++    switch (offset) {
++    case REG_PLL_CPU:
++    case REG_PLL_DDR:
++    case REG_PLL_PERI0:
++    case REG_PLL_VIDEO0:
++    case REG_PLL_VIDEO1:
++    case REG_PLL_VE:
++    case REG_PLL_AUDIO0:
++    case REG_PLL_AUDIO1:
++        /* PLL enable/lock: LOCK (bit 28) mirrors EN (bit 31). The D1 HAL
++         * polls LOCK in ccu_helper_wait_for_lock(). */
++        if (val & REG_PLL_ENABLE) {
++            val |= REG_PLL_LOCK;
++        } else {
++            val &= ~REG_PLL_LOCK;
++        }
++        break;
++    default:
++        break;
++    }
++
++    s->regs[idx] = val;
++}
++
++static const MemoryRegionOps d1s_ccu_ops = {
++    .read = d1s_ccu_read,
++    .write = d1s_ccu_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void d1s_ccu_reset(DeviceState *dev)
++{
++    D1SCCUState *s = D1S_CCU(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++
++    s->regs[REG_INDEX(REG_PLL_CPU)]     = REG_PLL_CPU_RST;
++    s->regs[REG_INDEX(REG_PLL_DDR)]     = REG_PLL_DDR_RST;
++    s->regs[REG_INDEX(REG_PLL_PERI0)]   = REG_PLL_PERI0_RST;
++    s->regs[REG_INDEX(REG_PLL_VIDEO0)]  = REG_PLL_VIDEO0_RST;
++    s->regs[REG_INDEX(REG_PLL_VIDEO1)]  = REG_PLL_VIDEO1_RST;
++    s->regs[REG_INDEX(REG_PLL_VE)]      = REG_PLL_VE_RST;
++    s->regs[REG_INDEX(REG_PLL_AUDIO0)]  = REG_PLL_AUDIO0_RST;
++    s->regs[REG_INDEX(REG_PLL_AUDIO1)]  = REG_PLL_AUDIO1_RST;
++
++    s->regs[REG_INDEX(REG_PSI_AHB)]     = REG_PSI_AHB_RST;
++    s->regs[REG_INDEX(REG_APB0)]        = REG_APB0_RST;
++    s->regs[REG_INDEX(REG_APB1)]        = REG_APB1_RST;
++}
++
++static void d1s_ccu_init(Object *obj)
++{
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    D1SCCUState *s = D1S_CCU(obj);
++
++    memory_region_init_io(&s->iomem, OBJECT(s), &d1s_ccu_ops, s,
++                          TYPE_D1S_CCU, D1S_CCU_SIZE);
++    sysbus_init_mmio(sbd, &s->iomem);
++}
++
++static const VMStateDescription d1s_ccu_vmstate = {
++    .name = "d1s-ccu",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, D1SCCUState, D1S_CCU_REGS_NUM),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static void d1s_ccu_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, d1s_ccu_reset);
++    dc->vmsd = &d1s_ccu_vmstate;
++}
++
++static const TypeInfo d1s_ccu_info = {
++    .name = TYPE_D1S_CCU,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_init = d1s_ccu_init,
++    .instance_size = sizeof(D1SCCUState),
++    .class_init = d1s_ccu_class_init,
++};
++
++static void d1s_ccu_register_types(void)
++{
++    type_register_static(&d1s_ccu_info);
++}
++
++type_init(d1s_ccu_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index b1d8d8e5d..ff803e150 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -50,6 +50,7 @@ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-h3-dramc.c'
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-h3-sysctrl.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-sid.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_R40', if_true: files('allwinner-r40-ccu.c'))
++system_ss.add(when: 'CONFIG_ALLWINNER_D1S', if_true: files('d1s_ccu.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_R40', if_true: files('allwinner-r40-dramc.c'))
+ system_ss.add(when: 'CONFIG_AXP2XX_PMU', if_true: files('axp2xx.c'))
+ system_ss.add(when: 'CONFIG_REALVIEW', if_true: files('arm_sysctl.c'))
+diff --git a/hw/riscv/d1s.c b/hw/riscv/d1s.c
+index b4582d7b6..318b943c0 100644
+--- a/hw/riscv/d1s.c
++++ b/hw/riscv/d1s.c
+@@ -167,6 +167,7 @@ static void d1s_init(MachineState *ms)
+ {
+     MemoryRegion *system_memory = get_system_memory();
+     DeviceState *plic;
++    DeviceState *dev;
+     size_t i;
+ 
+     /*
+@@ -194,6 +195,11 @@ static void d1s_init(MachineState *ms)
+                                     d1s_unimp[i].size);
+     }
+ 
++    /* CCU, mapped on top of the low peripheral unimplemented window. */
++    dev = qdev_new("d1s-ccu");
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
++    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, 0x02001000, 1);
++
+     plic = sifive_plic_create(d1s_memmap[D1S_PLIC].base,
+                               (char *)"MS", 1, 0,
+                               D1S_PLIC_NUM_SOURCES,

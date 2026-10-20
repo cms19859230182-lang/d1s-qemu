@@ -1,0 +1,509 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] hw/riscv: d1s: model the Allwinner D1s PIO (GPIO) controller
+
+hw/riscv: d1s: model the Allwinner D1s PIO (GPIO) controller
+
+Replace the RAZ/WI stub at 0x02000000 with a d1s-gpio device: banks
+PA..PG with CFG/DAT/DRV/PULL registers and the EINT block at 0x200
+(CFG/CTL, write-1-to-clear STATUS, DEB).  DAT reads back the driven
+value for output pins and the qdev input line level for the others;
+edge and level EINT sources set STATUS, and each bank raises its own
+PLIC source (PB..PG = 85..95).
+
+Upstream RT-Thread bsp/allwinner/d1s still boots to msh />.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+
+---
+diff --git a/hw/misc/d1s_gpio.c b/hw/misc/d1s_gpio.c
+new file mode 100644
+index 000000000..a8c77c71e
+--- /dev/null
++++ b/hw/misc/d1s_gpio.c
+@@ -0,0 +1,444 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Allwinner D1s GPIO controller emulation
++ *
++ * Copyright (c) 2026 cms19859230182-lang
++ *
++ * 7 banks of 32 pins (bank 0 is PA, the D1s uses PB..PG).  Each bank has a
++ * 0x30 byte register block (CFG0..3, DAT, DRV0..3, PULL0..1) and a 0x20
++ * byte external interrupt block (EINT_CFG0..3, EINT_CTL, EINT_STATUS,
++ * EINT_DEB) based at 0x200.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/sysbus.h"
++#include "hw/irq.h"
++#include "migration/vmstate.h"
++
++#define TYPE_D1S_GPIO "d1s-gpio"
++OBJECT_DECLARE_TYPE(D1SGpioState, D1SGpioClass, D1S_GPIO)
++
++#define D1S_GPIO_NB_BANKS        7
++#define D1S_GPIO_NB_PINS         32
++#define D1S_GPIO_NB_PINS_TOTAL   (D1S_GPIO_NB_BANKS * D1S_GPIO_NB_PINS)
++#define D1S_GPIO_MMIO_SIZE       0x800
++#define D1S_GPIO_BANK_STRIDE     0x30
++#define D1S_GPIO_EINT_STRIDE     0x20
++#define D1S_GPIO_EINT_BASE       0x200
++
++/* Bank register offsets */
++#define D1S_GPIO_REG_CFG0        0x00
++#define D1S_GPIO_REG_DAT         0x10
++#define D1S_GPIO_REG_DRV0        0x14
++#define D1S_GPIO_REG_PULL0       0x24
++
++/* External interrupt register offsets */
++#define D1S_GPIO_REG_EINT_CFG0   0x00
++#define D1S_GPIO_REG_EINT_CTL    0x10
++#define D1S_GPIO_REG_EINT_STATUS 0x14
++#define D1S_GPIO_REG_EINT_DEB    0x18
++
++/* Pin function values */
++#define D1S_GPIO_FN_INPUT        0
++#define D1S_GPIO_FN_OUTPUT       1
++
++/* External interrupt trigger modes */
++#define D1S_GPIO_EINT_POL_RISING  0
++#define D1S_GPIO_EINT_POL_FALLING 1
++#define D1S_GPIO_EINT_POL_HIGH    2
++#define D1S_GPIO_EINT_POL_LOW     3
++#define D1S_GPIO_EINT_POL_BOTH    4
++
++struct D1SGpioClass {
++    SysBusDeviceClass parent;
++};
++
++struct D1SGpioState {
++    SysBusDevice parent;
++
++    MemoryRegion iomem;
++
++    uint32_t cfg[D1S_GPIO_NB_BANKS][4];
++    uint32_t dat[D1S_GPIO_NB_BANKS];
++    uint32_t drv[D1S_GPIO_NB_BANKS][4];
++    uint32_t pull[D1S_GPIO_NB_BANKS][2];
++
++    uint32_t eint_cfg[D1S_GPIO_NB_BANKS][4];
++    uint32_t eint_ctl[D1S_GPIO_NB_BANKS];
++    uint32_t eint_status[D1S_GPIO_NB_BANKS];
++    uint32_t eint_deb[D1S_GPIO_NB_BANKS];
++
++    uint8_t input_level[D1S_GPIO_NB_BANKS];
++
++    qemu_irq gpio_out[D1S_GPIO_NB_PINS_TOTAL];
++    qemu_irq irq[D1S_GPIO_NB_BANKS];
++};
++
++#define D1S_GPIO(s) ((D1SGpioState *)(s))
++
++static inline uint8_t d1s_gpio_get_field(const uint32_t *regs, int reg,
++                                          int pin, int nbits)
++{
++    return (regs[reg] >> (pin * nbits)) & ((1u << nbits) - 1);
++}
++
++static inline void d1s_gpio_set_field(uint32_t *regs, int reg, int pin,
++                                      int nbits, uint32_t val)
++{
++    uint32_t mask = (1u << nbits) - 1;
++
++    regs[reg] &= ~(mask << (pin * nbits));
++    regs[reg] |= (val & mask) << (pin * nbits);
++}
++
++static inline uint8_t d1s_gpio_cfg(const D1SGpioState *s, int bank, int pin)
++{
++    return d1s_gpio_get_field(s->cfg[bank], pin >> 3, pin & 7, 4);
++}
++static inline uint8_t d1s_gpio_eint_pol(const D1SGpioState *s, int bank,
++                                        int pin)
++{
++    return d1s_gpio_get_field(s->eint_cfg[bank], pin >> 3, pin & 7, 4);
++}
++
++static void d1s_gpio_update_irq(D1SGpioState *s, int bank)
++{
++    qemu_set_irq(s->irq[bank],
++                 (s->eint_status[bank] & s->eint_ctl[bank]) != 0);
++}
++static void d1s_gpio_input_gpio(void *opaque, int n, int level)
++{
++    D1SGpioState *s = D1S_GPIO(opaque);
++    int bank = n / D1S_GPIO_NB_PINS;
++    int pin = n % D1S_GPIO_NB_PINS;
++    uint8_t pol = d1s_gpio_eint_pol(s, bank, pin);
++    bool lvl = level != 0;
++    bool was = (s->input_level[bank] >> pin) & 1;
++    bool trig = false;
++
++    if (lvl) {
++        s->input_level[bank] |= 1u << pin;
++    } else {
++        s->input_level[bank] &= ~(1u << pin);
++    }
++
++    switch (pol) {
++    case D1S_GPIO_EINT_POL_RISING:
++        trig = lvl && !was;
++        break;
++    case D1S_GPIO_EINT_POL_FALLING:
++        trig = !lvl && was;
++        break;
++    case D1S_GPIO_EINT_POL_HIGH:
++        trig = lvl;
++        break;
++    case D1S_GPIO_EINT_POL_LOW:
++        trig = !lvl;
++        break;
++    case D1S_GPIO_EINT_POL_BOTH:
++        trig = lvl != was;
++        break;
++    default:
++        break;
++    }
++
++    if (trig) {
++        s->eint_status[bank] |= 1u << pin;
++        d1s_gpio_update_irq(s, bank);
++    }
++}
++/*
++ * Register access
++ *
++ * Bank registers live at bank * 0x30, the external interrupt registers of
++ * a bank at 0x200 + bank * 0x20.
++ */
++
++static uint32_t d1s_gpio_read_bank(D1SGpioState *s, int bank, uint32_t off)
++{
++    switch (off) {
++    case D1S_GPIO_REG_CFG0:
++    case D1S_GPIO_REG_CFG0 + 4:
++    case D1S_GPIO_REG_CFG0 + 8:
++    case D1S_GPIO_REG_CFG0 + 0xc:
++        return s->cfg[bank][off / 4];
++    case D1S_GPIO_REG_DAT: {
++        uint32_t out = 0;
++
++        for (int pin = 0; pin < D1S_GPIO_NB_PINS; pin++) {
++            if (d1s_gpio_cfg(s, bank, pin) == D1S_GPIO_FN_OUTPUT) {
++                if (s->dat[bank] & (1u << pin)) {
++                    out |= 1u << pin;
++                }
++            } else if (s->input_level[bank] & (1u << pin)) {
++                out |= 1u << pin;
++            }
++        }
++        return out;
++    }
++    case D1S_GPIO_REG_DRV0:
++    case D1S_GPIO_REG_DRV0 + 4:
++    case D1S_GPIO_REG_DRV0 + 8:
++    case D1S_GPIO_REG_DRV0 + 0xc:
++        return s->drv[bank][(off - D1S_GPIO_REG_DRV0) / 4];
++    case D1S_GPIO_REG_PULL0:
++    case D1S_GPIO_REG_PULL0 + 4:
++        return s->pull[bank][(off - D1S_GPIO_REG_PULL0) / 4];
++    default:
++        return 0;
++    }
++}
++
++static uint32_t d1s_gpio_read_eint(D1SGpioState *s, int bank, uint32_t off)
++{
++    switch (off) {
++    case D1S_GPIO_REG_EINT_CFG0:
++    case D1S_GPIO_REG_EINT_CFG0 + 4:
++    case D1S_GPIO_REG_EINT_CFG0 + 8:
++    case D1S_GPIO_REG_EINT_CFG0 + 0xc:
++        return s->eint_cfg[bank][off / 4];
++    case D1S_GPIO_REG_EINT_CTL:
++        return s->eint_ctl[bank];
++    case D1S_GPIO_REG_EINT_STATUS:
++        return s->eint_status[bank];
++    case D1S_GPIO_REG_EINT_DEB:
++        return s->eint_deb[bank];
++    default:
++        return 0;
++    }
++}
++
++static uint64_t d1s_gpio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    D1SGpioState *s = D1S_GPIO(opaque);
++    uint32_t off = addr & 0x7fffffff;
++    int bank;
++
++    if (off >= D1S_GPIO_MMIO_SIZE) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "d1s-gpio: read from invalid offset 0x%" HWADDR_PRIx "\n",
++                      addr);
++        return 0;
++    }
++
++    if (off >= D1S_GPIO_EINT_BASE) {
++        uint32_t eoff = (off - D1S_GPIO_EINT_BASE) % D1S_GPIO_EINT_STRIDE;
++
++        bank = (off - D1S_GPIO_EINT_BASE) / D1S_GPIO_EINT_STRIDE;
++        if (bank >= D1S_GPIO_NB_BANKS) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "d1s-gpio: read from invalid bank %d\n", bank);
++            return 0;
++        }
++        return d1s_gpio_read_eint(s, bank, eoff);
++    }
++
++    bank = off / D1S_GPIO_BANK_STRIDE;
++    if (bank >= D1S_GPIO_NB_BANKS) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "d1s-gpio: read from invalid bank %d\n", bank);
++        return 0;
++    }
++
++    return d1s_gpio_read_bank(s, bank, off % D1S_GPIO_BANK_STRIDE);
++}
++
++static void d1s_gpio_write_bank(D1SGpioState *s, int bank, uint32_t off,
++                                uint32_t val)
++{
++    switch (off) {
++    case D1S_GPIO_REG_CFG0:
++    case D1S_GPIO_REG_CFG0 + 4:
++    case D1S_GPIO_REG_CFG0 + 8:
++    case D1S_GPIO_REG_CFG0 + 0xc:
++        s->cfg[bank][off / 4] = val;
++        break;
++    case D1S_GPIO_REG_DAT:
++        s->dat[bank] = val;
++        for (int pin = 0; pin < D1S_GPIO_NB_PINS; pin++) {
++            if (d1s_gpio_cfg(s, bank, pin) == D1S_GPIO_FN_OUTPUT) {
++                qemu_set_irq(s->gpio_out[bank * D1S_GPIO_NB_PINS + pin],
++                            (val & (1u << pin)) != 0);
++            }
++        }
++        break;
++    case D1S_GPIO_REG_DRV0:
++    case D1S_GPIO_REG_DRV0 + 4:
++    case D1S_GPIO_REG_DRV0 + 8:
++    case D1S_GPIO_REG_DRV0 + 0xc:
++        s->drv[bank][(off - D1S_GPIO_REG_DRV0) / 4] = val;
++        break;
++    case D1S_GPIO_REG_PULL0:
++    case D1S_GPIO_REG_PULL0 + 4:
++        s->pull[bank][(off - D1S_GPIO_REG_PULL0) / 4] = val;
++        break;
++    default:
++        break;
++    }
++}
++
++static void d1s_gpio_write_eint(D1SGpioState *s, int bank, uint32_t off,
++                                uint32_t val)
++{
++    switch (off) {
++    case D1S_GPIO_REG_EINT_CFG0:
++    case D1S_GPIO_REG_EINT_CFG0 + 4:
++    case D1S_GPIO_REG_EINT_CFG0 + 8:
++    case D1S_GPIO_REG_EINT_CFG0 + 0xc:
++        s->eint_cfg[bank][off / 4] = val;
++        break;
++    case D1S_GPIO_REG_EINT_CTL:
++        s->eint_ctl[bank] = val;
++        d1s_gpio_update_irq(s, bank);
++        break;
++    case D1S_GPIO_REG_EINT_STATUS:
++        val &= s->eint_status[bank];
++        s->eint_status[bank] &= ~val;
++        d1s_gpio_update_irq(s, bank);
++        break;
++    case D1S_GPIO_REG_EINT_DEB:
++        s->eint_deb[bank] = val;
++        break;
++    default:
++        break;
++    }
++}
++
++static void d1s_gpio_write(void *opaque, hwaddr addr, uint64_t val,
++                           unsigned size)
++{
++    D1SGpioState *s = D1S_GPIO(opaque);
++    uint32_t off = addr & 0x7fffffff;
++    uint32_t wval = (uint32_t) val;
++    int bank;
++
++    if (off >= D1S_GPIO_MMIO_SIZE) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "d1s-gpio: write to invalid offset 0x%" HWADDR_PRIx "\n",
++                      addr);
++        return;
++    }
++
++    if (off >= D1S_GPIO_EINT_BASE) {
++        uint32_t eoff = (off - D1S_GPIO_EINT_BASE) % D1S_GPIO_EINT_STRIDE;
++
++        bank = (off - D1S_GPIO_EINT_BASE) / D1S_GPIO_EINT_STRIDE;
++        if (bank >= D1S_GPIO_NB_BANKS) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "d1s-gpio: write to invalid bank %d\n", bank);
++            return;
++        }
++        d1s_gpio_write_eint(s, bank, eoff, wval);
++        return;
++    }
++
++    bank = off / D1S_GPIO_BANK_STRIDE;
++    if (bank >= D1S_GPIO_NB_BANKS) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "d1s-gpio: write to invalid bank %d\n", bank);
++        return;
++    }
++
++    d1s_gpio_write_bank(s, bank, off % D1S_GPIO_BANK_STRIDE, wval);
++}
++
++static const MemoryRegionOps d1s_gpio_ops = {
++    .read = d1s_gpio_read,
++    .write = d1s_gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++    .impl.min_access_size = 4,
++};
++
++static void d1s_gpio_reset(DeviceState *dev)
++{
++    D1SGpioState *s = D1S_GPIO(dev);
++
++    for (int b = 0; b < D1S_GPIO_NB_BANKS; b++) {
++        s->cfg[b][0] = 0xFFFFFFFF;
++        s->cfg[b][1] = 0xFFFFFFFF;
++        s->cfg[b][2] = 0xFFFFFFFF;
++        s->cfg[b][3] = 0xFFFFFFFF;
++        s->dat[b] = 0;
++        s->drv[b][0] = 0x11111111;
++        s->drv[b][1] = 0x11111111;
++        s->drv[b][2] = 0x11111111;
++        s->drv[b][3] = 0x11111111;
++        s->pull[b][0] = 0;
++        s->pull[b][1] = 0;
++        s->eint_cfg[b][0] = 0;
++        s->eint_cfg[b][1] = 0;
++        s->eint_cfg[b][2] = 0;
++        s->eint_cfg[b][3] = 0;
++        s->eint_ctl[b] = 0;
++        s->eint_status[b] = 0;
++        s->eint_deb[b] = 0;
++        s->input_level[b] = 0;
++    }
++}
++
++static void d1s_gpio_init(Object *obj)
++{
++    D1SGpioState *s = D1S_GPIO(obj);
++
++    memory_region_init_io(&s->iomem, OBJECT(s), &d1s_gpio_ops, s,
++                          TYPE_D1S_GPIO, D1S_GPIO_MMIO_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++
++    for (int b = 0; b < D1S_GPIO_NB_BANKS; b++) {
++        for (int p = 0; p < D1S_GPIO_NB_PINS; p++) {
++            qdev_init_gpio_in(DEVICE(s), d1s_gpio_input_gpio,
++                              b * D1S_GPIO_NB_PINS + p);
++        }
++        qdev_init_gpio_out_named(DEVICE(s), &s->gpio_out[b * D1S_GPIO_NB_PINS],
++                                 "out", D1S_GPIO_NB_PINS);
++        sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[b]);
++    }
++}
++
++static const VMStateDescription d1s_gpio_vmstate = {
++    .name = "d1s-gpio",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_2DARRAY(cfg, D1SGpioState, D1S_GPIO_NB_BANKS, 4),
++        VMSTATE_UINT32_ARRAY(dat, D1SGpioState, D1S_GPIO_NB_BANKS),
++        VMSTATE_UINT32_2DARRAY(drv, D1SGpioState, D1S_GPIO_NB_BANKS, 4),
++        VMSTATE_UINT32_2DARRAY(pull, D1SGpioState, D1S_GPIO_NB_BANKS, 2),
++        VMSTATE_UINT32_2DARRAY(eint_cfg, D1SGpioState, D1S_GPIO_NB_BANKS, 4),
++        VMSTATE_UINT32_ARRAY(eint_ctl, D1SGpioState, D1S_GPIO_NB_BANKS),
++        VMSTATE_UINT32_ARRAY(eint_status, D1SGpioState, D1S_GPIO_NB_BANKS),
++        VMSTATE_UINT32_ARRAY(eint_deb, D1SGpioState, D1S_GPIO_NB_BANKS),
++        VMSTATE_UINT8_ARRAY(input_level, D1SGpioState, D1S_GPIO_NB_BANKS),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static void d1s_gpio_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, d1s_gpio_reset);
++    dc->vmsd = &d1s_gpio_vmstate;
++}
++
++static const TypeInfo d1s_gpio_info = {
++    .name          = TYPE_D1S_GPIO,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_init = d1s_gpio_init,
++    .instance_size = sizeof(D1SGpioState),
++    .class_init    = d1s_gpio_class_init,
++};
++
++static void d1s_gpio_register(void)
++{
++    type_register_static(&d1s_gpio_info);
++}
++
++type_init(d1s_gpio_register)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index ff803e150..6193df65b 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -51,6 +51,7 @@ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-h3-sysctrl.
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-sid.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_R40', if_true: files('allwinner-r40-ccu.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_D1S', if_true: files('d1s_ccu.c'))
++system_ss.add(when: 'CONFIG_ALLWINNER_D1S', if_true: files('d1s_gpio.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_R40', if_true: files('allwinner-r40-dramc.c'))
+ system_ss.add(when: 'CONFIG_AXP2XX_PMU', if_true: files('axp2xx.c'))
+ system_ss.add(when: 'CONFIG_REALVIEW', if_true: files('arm_sysctl.c'))
+diff --git a/hw/riscv/d1s.c b/hw/riscv/d1s.c
+index 318b943c0..cc808eacb 100644
+--- a/hw/riscv/d1s.c
++++ b/hw/riscv/d1s.c
+@@ -212,6 +212,23 @@ static void d1s_init(MachineState *ms)
+                               D1S_PLIC_CONTEXT_STRIDE,
+                               d1s_memmap[D1S_PLIC].size);
+ 
++    /*
++     * GPIO controller (PA..PG), mapped on top of the periph-low
++     * unimplemented window.  Bank n (PA=0, PB=1, ... PG=6) is wired to
++     * PLIC source 83 + 2 * n; the PA slot is only a placeholder.
++     */
++    {
++        DeviceState *gpio = qdev_new("d1s-gpio");
++        int n;
++
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
++        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(gpio), 0, 0x02000000, 1);
++        for (n = 0; n < 7; n++) {
++            sysbus_connect_irq(SYS_BUS_DEVICE(gpio), n,
++                               qdev_get_gpio_in(plic, 83 + 2 * n));
++        }
++    }
++
+     riscv_aclint_swi_create(d1s_memmap[D1S_CLINT].base, 0, 1, false);
+     riscv_aclint_mtimer_create(d1s_memmap[D1S_CLINT].base +
+                                RISCV_ACLINT_SWI_SIZE,

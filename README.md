@@ -94,7 +94,10 @@ RT-Thread 的 D1s BSP 在上游 `bsp/allwinner/d1s`：
 | CLINT | `0x14000000` | 完整 | 上游 `riscv_aclint`，mtime 24 MHz |
 | SMHC0（SD/MMC） | `0x04020000` | 完整 | 复用上游 `allwinner-sdhost-sun50i-a64`，IRQ 56；`run.sh` 默认挂 `-drive if=sd,index=0` |
 | SMHC1（SDIO） | `0x04021000` | 完整 | 同上，IRQ 57；默认 `index=1` |
-| 其他所有外设（CCU、PIO/GPIO、其他 UART、定时器、看门狗、DMA、SPI、I2C、USB、SMHC2/eMMC、以太网、显示、音频、DDR 控制器……） | 其余地址 | 未模拟 | 兜底区：读返回 0、写被忽略（`--trace` 可看到访问日志） |
+| CCU（时钟） | `0x02001000` | 寄存器级 | PLL 置 EN 即报 LOCK，其余为读写存储；不算实际频率（patch 0006） |
+| PIO/GPIO | `0x02000000` | 寄存器级 | PA–PG 的 CFG/DAT/DRV/PULL 和外部中断，PB–PG 接 PLIC 85–95（patch 0007） |
+| DMA | `0x03002000` | 寄存器级 | 16 通道，描述符链同步按地址拷贝，IRQ 66；不模拟 DRQ 握手（patch 0008） |
+| 其他所有外设（其他 UART、定时器、看门狗、SPI、I2C、USB、SMHC2/eMMC、以太网、显示、音频、DDR 控制器……） | 其余地址 | 未模拟 | 兜底区：读返回 0、写被忽略（`--trace` 可看到访问日志） |
 
 ### 已知局限
 
@@ -208,7 +211,10 @@ Current status, stated plainly:
 | CLINT | `0x14000000` | full | upstream `riscv_aclint`, 24 MHz mtime |
 | SMHC0 (SD/MMC) | `0x04020000` | full | reuses upstream `allwinner-sdhost-sun50i-a64`, IRQ 56; `run.sh` attaches `-drive if=sd,index=0` by default |
 | SMHC1 (SDIO) | `0x04021000` | full | same, IRQ 57; default `index=1` |
-| Everything else (CCU, PIO/GPIO, other UARTs, timers, watchdog, DMA, SPI, I2C, USB, SMHC2/eMMC, Ethernet, display, audio, DRAM controller, …) | rest of the map | not modelled | catch-all window: reads 0, writes ignored |
+| CCU (clocks) | `0x02001000` | register-level | PLLs report LOCK once EN is set, everything else is storage; no real rates (patch 0006) |
+| PIO/GPIO | `0x02000000` | register-level | PA–PG CFG/DAT/DRV/PULL and EINT; PB–PG on PLIC 85–95 (patch 0007) |
+| DMA | `0x03002000` | register-level | 16 channels, descriptor chains copied synchronously by address, IRQ 66; no DRQ handshake (patch 0008) |
+| Everything else (other UARTs, timers, watchdog, SPI, I2C, USB, SMHC2/eMMC, Ethernet, display, audio, DRAM controller, …) | rest of the map | not modelled | catch-all window: reads 0, writes ignored |
 
 ### Known limitations
 

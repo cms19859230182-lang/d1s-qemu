@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cms19859230182-lang <276597748+cms19859230182-lang@users.noreply.github.com>
+Subject: [PATCH] hw/riscv: d1s: model the Allwinner D1s DMA controller
+
+hw/riscv: d1s: model the Allwinner D1s DMA controller
+
+Replace the RAZ/WI stub at 0x03002000 with a d1s-dma device: 16
+channels with IRQ_EN/IRQ_PEND (write-1-to-clear), AUTO_GATE, STATUS
+and the per-channel EN/PAUSE/DESC_ADDR/... block.  Setting EN walks the
+descriptor chain (cfg, src, dst, len, para, link; link 0xfffff800 ends
+it) synchronously, copies each block through address_space_memory,
+raises PKG/QUEUE pending bits and drives PLIC source 66.  DRQ
+handshaking is not modelled; peripheral transfers are copied by
+address.
+
+Upstream RT-Thread bsp/allwinner/d1s still boots to msh />.
+
+AI assistance: this change was written with help from Grok and reviewed
+and tested by a human.
+
+---
+diff --git a/hw/misc/d1s_dma.c b/hw/misc/d1s_dma.c
+new file mode 100644
+index 000000000..5166d53cb
+--- /dev/null
++++ b/hw/misc/d1s_dma.c
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * D1s DMA controller emulation
++ *
++ * Copyright (c) 2026 cms19859230182-lang
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "hw/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "system/address-spaces.h"
++
++#define TYPE_D1S_DMA "d1s-dma"
++#define D1S_DMA(obj) OBJECT_CHECK(D1sDMAState, obj, TYPE_D1S_DMA)
++
++#define D1S_DMA_NCHAN     16
++#define D1S_DMA_DESC_MAX  1024
++#define D1S_DMA_DESC_END  0xFFFFF800u
++
++/* Global registers */
++enum {
++    D1S_REG_IRQ_EN0   = 0x00,
++    D1S_REG_IRQ_EN1   = 0x04,
++    D1S_REG_IRQ_PEND0 = 0x10,
++    D1S_REG_IRQ_PEND1 = 0x14,
++    D1S_REG_SECURE    = 0x20,
++    D1S_REG_AUTO_GATE = 0x28,
++    D1S_REG_STATUS    = 0x30,
++    D1S_REG_CH_BASE   = 0x100,
++};
++
++/* Per-channel register offsets */
++enum {
++    D1S_CH_EN       = 0x00,
++    D1S_CH_PAUSE    = 0x04,
++    D1S_CH_DESC_ADDR = 0x08,
++    D1S_CH_CFG      = 0x0C,
++    D1S_CH_CUR_SRC  = 0x10,
++    D1S_CH_CUR_DST  = 0x14,
++    D1S_CH_BCNT     = 0x18,
++    D1S_CH_PARA     = 0x1C,
++    D1S_CH_MODE     = 0x28,
++    D1S_CH_FDESC    = 0x2C,
++    D1S_CH_PKG_NUM  = 0x30,
++};
++
++/* IRQ per-channel bit layout: bit0 HALF, bit1 PKG, bit2 QUEUE */
++#define D1S_IRQ_HALF   (1 << 0)
++#define D1S_IRQ_PKG    (1 << 1)
++#define D1S_IRQ_QUEUE  (1 << 2)
++
++typedef struct D1sChannel {
++    uint32_t en;
++    uint32_t pause;
++    uint32_t desc_addr;
++    uint32_t cfg;
++    uint32_t cur_src;
++    uint32_t cur_dst;
++    uint32_t bcnt;
++    uint32_t para;
++    uint32_t mode;
++    uint32_t pkg_num;
++    uint32_t fdesc;
++    uint32_t pend;
++} D1sChannel;
++
++typedef struct D1sDMAState {
++    SysBusDevice parent;
++    MemoryRegion iomem;
++    uint32_t irq_en[2];
++    uint32_t irq_pend[2];
++    uint32_t secure;
++    uint32_t auto_gate;
++    D1sChannel ch[D1S_DMA_NCHAN];
++    uint8_t buffer[4096];
++    qemu_irq irq;
++} D1sDMAState;
++
++static void d1s_dma_update_irq(D1sDMAState *s)
++{
++    uint32_t active = (s->irq_pend[0] & s->irq_en[0]) |
++                      (s->irq_pend[1] & s->irq_en[1]);
++
++    qemu_set_irq(s->irq, active);
++}
++static uint32_t d1s_dma_status(const D1sDMAState *s)
++{
++    uint32_t status = 0;
++
++    for (int i = 0; i < D1S_DMA_NCHAN; i++) {
++        if (s->ch[i].en) {
++            status |= 1u << i;
++        }
++    }
++    return status;
++}
++
++static void d1s_dma_set_pend(D1sDMAState *s, int ch, uint32_t bits)
++{
++    s->irq_pend[ch / 8] |= bits << (ch % 8) * 4;
++    d1s_dma_update_irq(s);
++}
++
++static void d1s_dma_read_desc(D1sDMAState *s, int ch, uint32_t addr,
++                              uint32_t desc[6])
++{
++    uint32_t i;
++
++    for (i = 0; i < 6; i++) {
++        address_space_read(&address_space_memory, addr + i * 4,
++                           MEMTXATTRS_UNSPECIFIED, desc + i, 4);
++    }
++}
++
++static void d1s_dma_run_channel(D1sDMAState *s, int ch)
++{
++    D1sChannel *c = &s->ch[ch];
++    uint32_t desc[6];
++    uint32_t link = c->desc_addr;
++    int count = 0;
++
++    c->en = 1;
++    c->bcnt = 0;
++    c->pkg_num = 0;
++
++    while (link != D1S_DMA_DESC_END && count < D1S_DMA_DESC_MAX) {
++        uint32_t len, src, dst;
++
++        d1s_dma_read_desc(s, ch, link, desc);
++        c->cfg = desc[0];
++        c->cur_src = desc[1];
++        c->cur_dst = desc[2];
++        c->para = desc[4];
++        c->fdesc = link;
++        len = desc[3];
++        src = desc[1];
++        dst = desc[2];
++
++        while (len > 0) {
++            uint32_t chunk = MIN(len, sizeof(s->buffer));
++            address_space_read(&address_space_memory, src,
++                               MEMTXATTRS_UNSPECIFIED, s->buffer, chunk);
++            address_space_write(&address_space_memory, dst,
++                                MEMTXATTRS_UNSPECIFIED, s->buffer, chunk);
++            src += chunk;
++            dst += chunk;
++            len -= chunk;
++        }
++
++        c->bcnt = 0;
++        c->pkg_num++;
++        d1s_dma_set_pend(s, ch, D1S_IRQ_PKG);
++        link = desc[5];
++        count++;
++    }
++
++    c->desc_addr = link;
++    d1s_dma_set_pend(s, ch, D1S_IRQ_QUEUE);
++    c->en = 0;
++    c->pause = 0;
++}
++
++static uint64_t d1s_dma_read(void *opaque, hwaddr offset, unsigned size)
++{
++    D1sDMAState *s = D1S_DMA(opaque);
++
++    switch (offset) {
++    case D1S_REG_IRQ_EN0:
++        return s->irq_en[0];
++    case D1S_REG_IRQ_EN1:
++        return s->irq_en[1];
++    case D1S_REG_IRQ_PEND0:
++        return s->irq_pend[0];
++    case D1S_REG_IRQ_PEND1:
++        return s->irq_pend[1];
++    case D1S_REG_SECURE:
++        return s->secure;
++    case D1S_REG_AUTO_GATE:
++        return s->auto_gate;
++    case D1S_REG_STATUS:
++        return d1s_dma_status(s);
++    default:
++        if (offset >= D1S_REG_CH_BASE && offset < D1S_REG_CH_BASE + D1S_DMA_NCHAN * 0x40) {
++            D1sChannel *c = &s->ch[(offset - D1S_REG_CH_BASE) / 0x40];
++            switch (offset % 0x40) {
++            case D1S_CH_EN:
++                return c->en;
++            case D1S_CH_PAUSE:
++                return c->pause;
++            case D1S_CH_DESC_ADDR:
++                return c->desc_addr;
++            case D1S_CH_CFG:
++                return c->cfg;
++            case D1S_CH_CUR_SRC:
++                return c->cur_src;
++            case D1S_CH_CUR_DST:
++                return c->cur_dst;
++            case D1S_CH_BCNT:
++                return c->bcnt;
++            case D1S_CH_PARA:
++                return c->para;
++            case D1S_CH_MODE:
++                return c->mode;
++            case D1S_CH_FDESC:
++                return c->fdesc;
++            case D1S_CH_PKG_NUM:
++                return c->pkg_num;
++            default:
++                return 0;
++            }
++        }
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: read out-of-range offset 0x%04x\n",
++                      __func__, (uint32_t)offset);
++        return 0;
++    }
++}
++
++static void d1s_dma_handle_en(D1sDMAState *s, int ch, uint32_t val)
++{
++    D1sChannel *c = &s->ch[ch];
++
++    c->en = val & 1;
++    if (c->en && !c->pause) {
++        d1s_dma_run_channel(s, ch);
++    }
++}
++
++static void d1s_dma_write(void *opaque, hwaddr offset, uint64_t val,
++                          unsigned size)
++{
++    D1sDMAState *s = D1S_DMA(opaque);
++    uint32_t v = (uint32_t)val;
++
++    switch (offset) {
++    case D1S_REG_IRQ_EN0:
++        s->irq_en[0] = v & 0x1f1f1f1f;
++        d1s_dma_update_irq(s);
++        break;
++    case D1S_REG_IRQ_EN1:
++        s->irq_en[1] = v & 0x1f1f1f1f;
++        d1s_dma_update_irq(s);
++        break;
++    case D1S_REG_IRQ_PEND0:
++        s->irq_pend[0] &= ~(v & 0x1f1f1f1f);
++        d1s_dma_update_irq(s);
++        break;
++    case D1S_REG_IRQ_PEND1:
++        s->irq_pend[1] &= ~(v & 0x1f1f1f1f);
++        d1s_dma_update_irq(s);
++        break;
++    case D1S_REG_SECURE:
++        s->secure = v;
++        break;
++    case D1S_REG_AUTO_GATE:
++        s->auto_gate = v & 0x7;
++        break;
++    default:
++        if (offset >= D1S_REG_CH_BASE && offset < D1S_REG_CH_BASE + D1S_DMA_NCHAN * 0x40) {
++            int ch = (offset - D1S_REG_CH_BASE) / 0x40;
++            D1sChannel *c = &s->ch[ch];
++            switch (offset % 0x40) {
++            case D1S_CH_EN:
++                d1s_dma_handle_en(s, ch, v);
++                break;
++            case D1S_CH_PAUSE:
++                c->pause = v & 1;
++                break;
++            case D1S_CH_DESC_ADDR:
++                c->desc_addr = v;
++                break;
++            case D1S_CH_MODE:
++                c->mode = v;
++                break;
++            default:
++                qemu_log_mask(LOG_GUEST_ERROR, "%s: channel write to RO "
++                              "offset 0x%04x\n", __func__, (uint32_t)offset);
++                break;
++            }
++        } else {
++            qemu_log_mask(LOG_GUEST_ERROR, "%s: write out-of-range offset "
++                          "0x%04x\n", __func__, (uint32_t)offset);
++        }
++        break;
++    }
++}
++
++static const MemoryRegionOps d1s_dma_ops = {
++    .read = d1s_dma_read,
++    .write = d1s_dma_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++    .impl.min_access_size = 4,
++};
++
++static void d1s_dma_reset(DeviceState *dev)
++{
++    D1sDMAState *s = D1S_DMA(dev);
++
++    memset(s->ch, 0, sizeof(s->ch));
++    s->irq_en[0] = 0;
++    s->irq_en[1] = 0;
++    s->irq_pend[0] = 0;
++    s->irq_pend[1] = 0;
++    s->secure = 0;
++    s->auto_gate = 0;
++    qemu_set_irq(s->irq, 0);
++}
++
++static void d1s_dma_realize(DeviceState *dev, Error **err)
++{
++    D1sDMAState *s = D1S_DMA(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static void d1s_dma_init(Object *obj)
++{
++    D1sDMAState *s = D1S_DMA(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &d1s_dma_ops, s,
++                          TYPE_D1S_DMA, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++}
++
++static const VMStateDescription vmstate_d1s_channel = {
++    .name = "d1s-channel",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(en, D1sChannel),
++        VMSTATE_UINT32(pause, D1sChannel),
++        VMSTATE_UINT32(desc_addr, D1sChannel),
++        VMSTATE_UINT32(cfg, D1sChannel),
++        VMSTATE_UINT32(cur_src, D1sChannel),
++        VMSTATE_UINT32(cur_dst, D1sChannel),
++        VMSTATE_UINT32(bcnt, D1sChannel),
++        VMSTATE_UINT32(para, D1sChannel),
++        VMSTATE_UINT32(mode, D1sChannel),
++        VMSTATE_UINT32(pkg_num, D1sChannel),
++        VMSTATE_UINT32(pend, D1sChannel),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const VMStateDescription d1s_dma_vmstate = {
++    .name = "d1s-dma",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(irq_en, D1sDMAState, 2),
++        VMSTATE_UINT32_ARRAY(irq_pend, D1sDMAState, 2),
++        VMSTATE_UINT32(secure, D1sDMAState),
++        VMSTATE_UINT32(auto_gate, D1sDMAState),
++        VMSTATE_STRUCT_ARRAY(ch, D1sDMAState, D1S_DMA_NCHAN, 0,
++                            vmstate_d1s_channel, D1sChannel),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static void d1s_dma_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = d1s_dma_realize;
++    dc->desc = "D1s DMA controller";
++    device_class_set_legacy_reset(dc, d1s_dma_reset);
++    dc->vmsd = &d1s_dma_vmstate;
++}
++
++static const TypeInfo d1s_dma_info = {
++    .name          = TYPE_D1S_DMA,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_init = d1s_dma_init,
++    .instance_size = sizeof(D1sDMAState),
++    .class_init    = d1s_dma_class_init,
++};
++
++static void d1s_dma_register(void)
++{
++    type_register_static(&d1s_dma_info);
++}
++
++type_init(d1s_dma_register)
++
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 6193df65b..d713e327f 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -44,6 +44,7 @@ system_ss.add(when: 'CONFIG_IVSHMEM_FLAT_DEVICE', if_true: files('ivshmem-flat.c
+ system_ss.add(when: 'CONFIG_ALLWINNER_SRAMC', if_true: files('allwinner-sramc.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_A10_CCM', if_true: files('allwinner-a10-ccm.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_A10_DRAMC', if_true: files('allwinner-a10-dramc.c'))
++system_ss.add(when: 'CONFIG_ALLWINNER_D1S', if_true: files('d1s_dma.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-h3-ccu.c'))
+ specific_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-cpucfg.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-h3-dramc.c'))
+diff --git a/hw/riscv/d1s.c b/hw/riscv/d1s.c
+index cc808eacb..1d6136af1 100644
+--- a/hw/riscv/d1s.c
++++ b/hw/riscv/d1s.c
+@@ -293,6 +293,16 @@ static void d1s_init(MachineState *ms)
+                                    &error_fatal);
+         }
+     }
++
++    /* DMAC, mapped on top of the low peripheral unimplemented window. */
++    {
++        DeviceState *dma = qdev_new("d1s-dma");
++
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(dma), &error_fatal);
++        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dma), 0, 0x03002000, 1);
++        sysbus_connect_irq(SYS_BUS_DEVICE(dma), 0,
++                           qdev_get_gpio_in(plic, 66));
++    }
+ }
+ 
+ static void d1s_machine_init(MachineClass *mc)
